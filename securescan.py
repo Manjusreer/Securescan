@@ -1,59 +1,93 @@
-from scapy.all import sniff, IP, ICMP, ARP
+from scapy.all import sniff, IP, ICMP, TCP, ARP, DNS, DNSQR, UDP
+from datetime import datetime
 from collections import defaultdict
 import logging
-import time
 
-# Setup logging
+# Configure logging
 logging.basicConfig(filename="alerts.log", level=logging.INFO, format='%(asctime)s - %(message)s')
 
 print("[+] SecureScan NIDS is running...")
 
-# ICMP tracking
-icmp_counts = defaultdict(list)
-icmp_threshold = 45  # Adjust as needed
-icmp_window = 10     # seconds
+# Data structures for tracking
+icmp_timestamps = defaultdict(list)
+tcp_syn_counter = defaultdict(list)
+arp_spoof_detected = set()
+dns_request_counter = defaultdict(list)
 
-# ARP spoof tracking
-arp_table = {}
+# Thresholds
+ICMP_THRESHOLD = 45
+PING_OF_DEATH_SIZE = 1000
+TCP_THRESHOLD = 10
+DNS_THRESHOLD = 3
+DOMAIN_LENGTH_THRESHOLD = 50  # characters
 
-# Function to handle each packet
-def process_packet(packet):
-    # ICMP flood & Ping of Death detection
-    if packet.haslayer(ICMP):
-        src_ip = packet[IP].src
-        icmp_counts[src_ip].append(time.time())
+def detect_packet(packet):
+    now = datetime.now()
 
-        # Remove old timestamps outside the window
-        icmp_counts[src_ip] = [t for t in icmp_counts[src_ip] if time.time() - t <= icmp_window]
-
-        count = len(icmp_counts[src_ip])
-        print(f"[DEBUG] ICMP from {src_ip}: count = {count}")
-
-        # ICMP flood detection
-        if count > icmp_threshold:
-            alert = f"[!] ALERT: Possible ICMP flood from {src_ip}"
-            print(alert)
-            logging.info(alert)
-            icmp_counts[src_ip] = []  # reset count after alert
-
-        # Ping of Death detection (check for large packet size)
-        if packet.haslayer(IP) and len(packet) > 1000:  # adjust threshold as needed
-            alert = f"[!] ALERT: Possible Ping of Death attack from {src_ip} (size: {len(packet)} bytes)"
+    # ICMP Flood & Ping of Death
+    if packet.haslayer(ICMP) and packet.haslayer(IP):
+        ip = packet[IP].src
+        icmp_timestamps[ip].append(now)
+        icmp_timestamps[ip] = [t for t in icmp_timestamps[ip] if (now - t).total_seconds() <= 10]
+        if len(icmp_timestamps[ip]) > ICMP_THRESHOLD:
+            alert = f"[!] ALERT: Possible ICMP flood from {ip}"
             print(alert)
             logging.info(alert)
 
-    # ARP spoofing detection
-    if packet.haslayer(ARP) and packet[ARP].op == 2:  # ARP reply (is-at)
-        ip = packet[ARP].psrc
-        mac = packet[ARP].hwsrc
+        if len(packet) > PING_OF_DEATH_SIZE:
+            alert = f"[!] ALERT: Possible Ping of Death from {ip} (size = {len(packet)} bytes)"
+            print(alert)
+            logging.info(alert)
 
-        if ip in arp_table:
-            if arp_table[ip] != mac:
-                alert = f"[!] ALERT: Possible ARP spoofing detected! {ip} is claiming {mac}, expected {arp_table[ip]}"
+    # ARP Spoofing Detection
+    if packet.haslayer(ARP) and packet[ARP].op == 2:
+        sender_ip = packet[ARP].psrc
+        sender_mac = packet[ARP].hwsrc
+        if sender_ip in arp_spoof_detected:
+            return
+        arp_spoof_detected.add(sender_ip)
+        alert = f"[!] ALERT: ARP spoofing attempt from IP: {sender_ip}, MAC: {sender_mac}"
+        print(alert)
+        logging.info(alert)
+
+    # TCP Brute-force Login Detection
+    if packet.haslayer(TCP) and packet.haslayer(IP):
+        if packet[TCP].flags == "S":  # SYN flag
+            src_ip = packet[IP].src
+            dst_port = packet[TCP].dport
+            key = (src_ip, dst_port)
+            tcp_syn_counter[key] = [t for t in tcp_syn_counter[key] if (now - t).total_seconds() <= 10]
+            tcp_syn_counter[key].append(now)
+            if len(tcp_syn_counter[key]) > TCP_THRESHOLD:
+                alert = f"[!] ALERT: Possible TCP brute-force attempt from {src_ip} to port {dst_port}"
                 print(alert)
                 logging.info(alert)
-        else:
-            arp_table[ip] = mac
+                tcp_syn_counter[key].clear()
 
-# Start sniffing
-sniff(iface="eth0", prn=process_packet, store=0)
+    # DNS Tunneling Detection
+    if packet.haslayer(DNS) and packet.haslayer(DNSQR) and packet.haslayer(UDP):
+        print(f"[DEBUG] DNS query from {packet[IP].src}: {packet[DNSQR].qname.decode().strip('.')}")
+        src_ip = packet[IP].src
+        query_name = packet[DNSQR].qname.decode().strip('.')
+        dns_request_counter[src_ip].append(now)
+
+        # Filter out timestamps older than 10 seconds
+        dns_request_counter[src_ip] = [t for t in dns_request_counter[src_ip] if (now - t).total_seconds() <= 10]
+
+        # Detect high frequency of DNS requests
+        if len(dns_request_counter[src_ip]) > DNS_THRESHOLD:
+            alert = f"[!] ALERT: High frequency DNS queries from {src_ip} - Possible DNS tunneling"
+            print(alert)
+            logging.info(alert)
+            dns_request_counter[src_ip].clear()
+
+        # Detect unusually long domain names
+        if len(query_name) > DOMAIN_LENGTH_THRESHOLD:
+            alert = f"[!] ALERT: Suspiciously long DNS query from {src_ip}: {query_name}"
+            print(alert)
+            logging.info(alert)
+
+
+
+# Start packet sniffing
+sniff(filter="udp port 53", prn=detect_packet, store=0)
